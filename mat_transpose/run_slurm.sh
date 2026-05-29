@@ -5,7 +5,7 @@ GEM5_PATH=$GEM5_ROOT/build/VEGA_X86
 APPTAINER_IMG=$GEM5_WORKSPACE/gcn-gpu_v24-0.sif
 
 for CU in 2 4 8; do
-    srun --ntasks=1 --time=02:00:00 --output=log_cu${CU}.txt \
+    srun --ntasks=1 --time=02:00:00 --output=log_cu${CU}.txt --reservation=fri \
         apptainer exec $APPTAINER_IMG \
         $GEM5_PATH/gem5.opt --outdir=results/cu_${CU} \
         $GEM5_ROOT/configs/example/apu_se.py \
