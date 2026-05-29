@@ -31,7 +31,6 @@ horner_scheme/
 stencil/
 solutions.txt
 
-results/
 *.err
 *.log
 copilot-instructions.md
