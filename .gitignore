@@ -7,7 +7,6 @@ hpc_gemm_sol.c
 hpc_gemm_sol
 jacobi.c
 *.out
-*.txt
 .Xilinx/
 *.back
 .vscode/
@@ -29,7 +28,15 @@ horner_scheme/
 stencil/
 solutions.txt
 
-results/
 *.err
 *.log
 copilot-instructions.md
+!run_slurm.sh
+
+citations.bib
+config.dot
+config.dot.pdf
+config.dot.svg
+config.ini
+config.system.*
+**/results/cu_*/fs/*
