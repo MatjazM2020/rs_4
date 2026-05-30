@@ -1,207 +1,442 @@
 #!/usr/bin/env python3
 """
-Results extraction for histogram GEM5 benchmarks.
+Exact histogram stats analysis for the checked-in gem5 stats files.
 
-Reads:
-  ./results/naive/cu_N/stats.txt
-  ./results/optimized/cu_N/stats.txt
+The stats files have two simulation-stat sections:
+  1. kernel execution, containing the useful GPU counters
+  2. post-kernel aggregate/reset stats, where the CU counters are zero/nan
 
-For each run, section 0 contains the kernel execution statistics and section 1
-is the post-completion aggregate. Only section 0 is used for task 1.
+This script intentionally reads only section 0 and uses exact stat names from
+the current files instead of suffix matching.
 """
 
-import re
+from __future__ import annotations
+
+import math
 import sys
+import warnings
+from dataclasses import dataclass
 from pathlib import Path
 
 
-KERNELS = ["naive", "optimized"]
-CU_VALUES = [2, 4, 8]
-
-METRICS = [
-    "loadLatencyDist::mean",
-    "vALUInsts",
-    "ldsBankAccesses",
-    "totalCycles",
-    "vpc",
-]
+KERNELS = ("naive", "optimized")
+CU_COUNTS = (2, 4, 8)
+GPU_PREFIX = "system.cpu3"
 
 
-def parse_stats(filepath):
-    """Return list of stat sections. Each section is a dict key->value."""
-    sections = []
-    current = {}
-    in_section = False
-    with open(filepath) as f:
-        for line in f:
-            if line.startswith("---------- Begin"):
+@dataclass(frozen=True)
+class RunStats:
+    kernel: str
+    cu_count: int
+    load_latency_mean: float
+    valu_insts_by_cu: tuple[float, ...]
+    lds_bank_accesses_by_cu: tuple[float, ...]
+    total_cycles_by_cu: tuple[float, ...]
+    vpc_by_cu: tuple[float, ...]
+
+    @property
+    def valu_insts_total(self) -> float:
+        return sum(self.valu_insts_by_cu)
+
+    @property
+    def valu_insts_mean(self) -> float:
+        return mean(self.valu_insts_by_cu)
+
+    @property
+    def lds_bank_accesses_total(self) -> float:
+        return sum(self.lds_bank_accesses_by_cu)
+
+    @property
+    def lds_bank_accesses_mean(self) -> float:
+        return mean(self.lds_bank_accesses_by_cu)
+
+    @property
+    def total_cycles_mean(self) -> float:
+        return mean(self.total_cycles_by_cu)
+
+    @property
+    def vpc_mean(self) -> float:
+        return mean(self.vpc_by_cu)
+
+    @property
+    def min_vpc(self) -> float:
+        return min(self.vpc_by_cu)
+
+    @property
+    def max_vpc(self) -> float:
+        return max(self.vpc_by_cu)
+
+
+def mean(values: tuple[float, ...]) -> float:
+    return sum(values) / len(values)
+
+
+def parse_stats_sections(path: Path) -> list[dict[str, float]]:
+    sections: list[dict[str, float]] = []
+    current: dict[str, float] | None = None
+
+    with path.open(encoding="utf-8") as stats_file:
+        for line in stats_file:
+            if line.startswith("---------- Begin Simulation Statistics ----------"):
                 current = {}
-                in_section = True
-            elif line.startswith("---------- End"):
-                if in_section:
+                continue
+            if line.startswith("---------- End Simulation Statistics"):
+                if current is not None:
                     sections.append(current)
-                in_section = False
-            elif in_section:
-                match = re.match(r"^(\S+)\s+(\S+)", line)
-                if match:
-                    try:
-                        current[match.group(1)] = float(match.group(2))
-                    except ValueError:
-                        current[match.group(1)] = match.group(2)
+                    current = None
+                continue
+            if current is None:
+                continue
+
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+
+            key, raw_value = parts[0], parts[1]
+            try:
+                value = float(raw_value)
+            except ValueError:
+                continue
+            current[key] = value
+
+    if current is not None:
+        raise ValueError(f"{path} has an unterminated simulation-stat section")
+
+    if not sections:
+        raise ValueError(f"{path} does not contain any complete stats sections")
+
     return sections
 
 
-def extract_metrics(section):
-    """Average all per-CU stat keys that end with each metric name."""
-    result = {}
-    for metric in METRICS:
-        matches = [
-            value
-            for key, value in section.items()
-            if isinstance(value, float)
-            and (key == metric or key.endswith("." + metric))
-        ]
-        result[metric] = sum(matches) / len(matches) if matches else None
-    return result
+def parse_first_stats_section(path: Path) -> dict[str, float]:
+    sections = parse_stats_sections(path)
+    if len(sections) != 2:
+        raise ValueError(f"{path} has {len(sections)} sections, expected 2")
+    return sections[0]
 
 
-def fmt(value, decimals=2):
-    if value is None:
-        return "N/A"
-    return f"{value:.{decimals}f}"
+def require_finite(stats: dict[str, float], key: str, path: Path) -> float:
+    try:
+        value = stats[key]
+    except KeyError as exc:
+        raise KeyError(f"{path} is missing required stat {key}") from exc
+
+    if not math.isfinite(value):
+        raise ValueError(f"{path} has non-finite value for {key}: {value}")
+    return value
 
 
-def load_data():
-    results_root = Path("results")
-    if not results_root.exists():
-        print(f"Error: '{results_root}' directory not found", file=sys.stderr)
-        sys.exit(1)
+def exact_cu_values(
+    stats: dict[str, float],
+    metric: str,
+    cu_count: int,
+    path: Path,
+) -> tuple[float, ...]:
+    prefix = f"{GPU_PREFIX}.CUs"
+    expected_keys = [f"{prefix}{cu}.{metric}" for cu in range(cu_count)]
+    values = tuple(require_finite(stats, key, path) for key in expected_keys)
 
-    data = {}
-    for cu in CU_VALUES:
-        data[cu] = {}
+    actual_cus = sorted(
+        int(key.removeprefix(prefix).split(".", 1)[0])
+        for key in stats
+        if key.startswith(prefix)
+        and key.endswith(f".{metric}")
+        and key.removeprefix(prefix).split(".", 1)[0].isdigit()
+    )
+    expected_cus = list(range(cu_count))
+    if actual_cus != expected_cus:
+        raise ValueError(
+            f"{path} has {metric} for CUs {actual_cus}, expected {expected_cus}"
+        )
+
+    return values
+
+
+def load_run(root: Path, kernel: str, cu_count: int) -> RunStats:
+    path = root / kernel / f"cu_{cu_count}" / "stats.txt"
+    stats = parse_first_stats_section(path)
+
+    return RunStats(
+        kernel=kernel,
+        cu_count=cu_count,
+        load_latency_mean=require_finite(
+            stats, f"{GPU_PREFIX}.loadLatencyDist::mean", path
+        ),
+        valu_insts_by_cu=exact_cu_values(stats, "vALUInsts", cu_count, path),
+        lds_bank_accesses_by_cu=exact_cu_values(
+            stats, "ldsBankAccesses", cu_count, path
+        ),
+        total_cycles_by_cu=exact_cu_values(stats, "totalCycles", cu_count, path),
+        vpc_by_cu=exact_cu_values(stats, "vpc", cu_count, path),
+    )
+
+
+def load_all(root: Path) -> dict[int, dict[str, RunStats]]:
+    data: dict[int, dict[str, RunStats]] = {}
+    for cu_count in CU_COUNTS:
+        data[cu_count] = {}
         for kernel in KERNELS:
-            stats_file = results_root / kernel / f"cu_{cu}" / "stats.txt"
-            if not stats_file.exists():
-                print(f"Warning: {stats_file} not found, skipping", file=sys.stderr)
-                continue
-
-            sections = parse_stats(stats_file)
-            if not sections:
-                print(f"Warning: {stats_file} has no sections", file=sys.stderr)
-                continue
-
-            data[cu][kernel] = extract_metrics(sections[0])
-
-        if not data[cu]:
-            del data[cu]
-
-    if not data:
-        print("No data found.", file=sys.stderr)
-        sys.exit(1)
-
+            data[cu_count][kernel] = load_run(root, kernel, cu_count)
     return data
 
 
-def print_console_summary(data):
-    col_w = 18
+def fmt(value: float, decimals: int = 2) -> str:
+    if decimals == 0:
+        return f"{value:.0f}"
+    return f"{value:.{decimals}f}"
 
-    print("=" * 90)
-    print("Histogram GEM5 Performance Analysis (averaged across CUs)")
-    print("=" * 90)
 
-    for metric in METRICS:
-        print(f"\nMetric: {metric}")
-        header = (
-            f"{'CU':<6}"
-            f"{'Naive':>{col_w}}"
-            f"{'Optimized':>{col_w}}"
-            f"{'Ratio (N/O)':>{col_w}}"
+def ratio(numerator: float, denominator: float) -> str:
+    if denominator == 0:
+        return "N/A"
+    return f"{numerator / denominator:.3f}x"
+
+
+def pct_change(new: float, old: float) -> str:
+    if old == 0:
+        return "N/A"
+    return f"{(new - old) / old * 100:+.1f}%"
+
+
+def assignment_metric_rows() -> list[tuple[str, str, str, int]]:
+    return [
+        ("loadLatencyDist::mean", "load_latency_mean", "Lower is better", 2),
+        ("vALUInsts", "valu_insts_mean", "Average across active CUs", 2),
+        ("ldsBankAccesses", "lds_bank_accesses_mean", "Average across active CUs", 2),
+        ("totalCycles", "total_cycles_mean", "Average across active CUs", 0),
+        ("vpc", "vpc_mean", "Average across active CUs", 2),
+    ]
+
+
+def diagnostic_metric_rows() -> list[tuple[str, str, str, int]]:
+    return [
+        ("vALUInsts total", "valu_insts_total", "Diagnostic total across active CUs", 0),
+        (
+            "ldsBankAccesses total",
+            "lds_bank_accesses_total",
+            "Diagnostic total across active CUs",
+            0,
+        ),
+        ("vpc range", "vpc_range", "Diagnostic min..max across CUs", 2),
+    ]
+
+
+def validate_comparison_rows(
+    rows: list[tuple[str, str, str, int]], section_name: str
+) -> None:
+    has_average = any(
+        "Average across active CUs" in note for _label, _attr, note, _dec in rows
+    )
+    has_total = any(attr.endswith("_total") for _label, attr, _note, _dec in rows)
+    if has_average and has_total:
+        warnings.warn(
+            f"{section_name} mixes average-per-CU assignment values and diagnostic totals",
+            RuntimeWarning,
+            stacklevel=2,
         )
-        print(header)
-        print("-" * len(header))
-        for cu in CU_VALUES:
-            if cu not in data:
-                print(f"{cu:<6}{'(missing)':>{col_w}}")
-                continue
-            vn = data[cu].get("naive", {}).get(metric)
-            vo = data[cu].get("optimized", {}).get(metric)
-            ratio = f"{vn / vo:.3f}" if (vn is not None and vo not in (None, 0)) else "N/A"
-            print(f"{cu:<6}{fmt(vn):>{col_w}}{fmt(vo):>{col_w}}{ratio:>{col_w}}")
 
 
-def generate_markdown_report(data):
-    md = []
-
-    md.append("# Histogram GEM5 Performance Analysis")
-    md.append("")
-    md.append("Simulations run with 2, 4, and 8 compute units.")
-    md.append("Values are averaged across all CUs within the kernel execution section.")
-    md.append("")
-
-    md.append("## Metrics by Compute Unit")
-    md.append("")
-    for metric in METRICS:
-        md.append(f"### {metric}")
-        md.append("")
-        md.append("| CU | Naive | Optimized | Ratio (N/O) |")
-        md.append("|----|-------|-----------|-------------|")
-        for cu in CU_VALUES:
-            vn = data.get(cu, {}).get("naive", {}).get(metric)
-            vo = data.get(cu, {}).get("optimized", {}).get(metric)
-            ratio = f"{vn / vo:.3f}" if (vn is not None and vo not in (None, 0)) else "N/A"
-            md.append(f"| {cu} | {fmt(vn)} | {fmt(vo)} | {ratio} |")
-        md.append("")
-
-    md.append("## Scalability (Total Cycles)")
-    md.append("")
-    for kernel, label in [("naive", "Naive"), ("optimized", "Optimized")]:
-        md.append(f"### {label}")
-        md.append("")
-        md.append("| CU | Total Cycles | Speedup vs 2 CU |")
-        md.append("|----|--------------|-----------------|")
-        base = data.get(CU_VALUES[0], {}).get(kernel, {}).get("totalCycles")
-        for cu in CU_VALUES:
-            val = data.get(cu, {}).get(kernel, {}).get("totalCycles")
-            if val is None:
-                md.append(f"| {cu} | N/A | N/A |")
-            elif base in (None, 0):
-                md.append(f"| {cu} | {fmt(val, 0)} | N/A |")
-            else:
-                md.append(f"| {cu} | {fmt(val, 0)} | {base / val:.3f}x |")
-        md.append("")
-
-    md.append("## Full Comparison per CU")
-    md.append("")
-    for cu in CU_VALUES:
-        if cu not in data:
-            continue
-        md.append(f"### {cu} Compute Units")
-        md.append("")
-        md.append("| Metric | Naive | Optimized | Diff (N-O) | Change % |")
-        md.append("|--------|-------|-----------|------------|----------|")
-        for metric in METRICS:
-            vn = data[cu].get("naive", {}).get(metric)
-            vo = data[cu].get("optimized", {}).get(metric)
-            if vn is None or vo is None:
-                md.append(f"| {metric} | {fmt(vn)} | {fmt(vo)} | N/A | N/A |")
-                continue
-            diff = abs(vn - vo)
-            pct = diff / vn * 100 if vn != 0 else 0
-            md.append(f"| {metric} | {fmt(vn)} | {fmt(vo)} | {fmt(diff)} | {pct:.1f}% |")
-        md.append("")
-
-    report_path = Path("histogram_results.md")
-    report_path.write_text("\n".join(md))
-    print(f"\nReport saved to: {report_path}")
+def metric_value(run: RunStats, attr: str, decimals: int) -> str:
+    if attr == "vpc_range":
+        return f"{fmt(run.min_vpc, decimals)}..{fmt(run.max_vpc, decimals)}"
+    return fmt(getattr(run, attr), decimals)
 
 
-def main():
-    data = load_data()
+def metric_number(run: RunStats, attr: str) -> float | None:
+    if attr == "vpc_range":
+        return None
+    return getattr(run, attr)
+
+
+def print_console_summary(data: dict[int, dict[str, RunStats]]) -> None:
+    print("Histogram exact gem5 analysis")
+    print("=" * 88)
+    print("Section used: first simulation-stat section only")
+    print(
+        "Assignment metrics: vALUInsts, ldsBankAccesses, totalCycles, "
+        "and vpc are averages across active CUs"
+    )
+    print("Diagnostic totals are printed separately and are not homework-table values")
+
+    for cu_count in CU_COUNTS:
+        naive = data[cu_count]["naive"]
+        optimized = data[cu_count]["optimized"]
+        print(f"\n{cu_count} CUs")
+        print("-" * 88)
+        print("Assignment metrics")
+        print(
+            f"{'gem5 stat':<26} {'Naive':>16} "
+            f"{'Optimized':>16} {'Optimized vs Naive':>20}"
+        )
+        validate_comparison_rows(assignment_metric_rows(), "Histogram assignment metrics")
+        for label, attr, _note, decimals in assignment_metric_rows():
+            naive_num = metric_number(naive, attr)
+            optimized_num = metric_number(optimized, attr)
+            change = (
+                pct_change(optimized_num, naive_num)
+                if naive_num is not None and optimized_num is not None
+                else "N/A"
+            )
+            print(
+                f"{label:<26} "
+                f"{metric_value(naive, attr, decimals):>16} "
+                f"{metric_value(optimized, attr, decimals):>16} "
+                f"{change:>20}"
+            )
+        print("\nDiagnostic totals")
+        print(
+            f"{'Metric':<26} {'Naive':>16} "
+            f"{'Optimized':>16} {'Optimized vs Naive':>20}"
+        )
+        validate_comparison_rows(diagnostic_metric_rows(), "Histogram diagnostic metrics")
+        for label, attr, _note, decimals in diagnostic_metric_rows():
+            naive_num = metric_number(naive, attr)
+            optimized_num = metric_number(optimized, attr)
+            change = (
+                pct_change(optimized_num, naive_num)
+                if naive_num is not None and optimized_num is not None
+                else "N/A"
+            )
+            print(
+                f"{label:<26} "
+                f"{metric_value(naive, attr, decimals):>16} "
+                f"{metric_value(optimized, attr, decimals):>16} "
+                f"{change:>20}"
+            )
+
+
+def markdown_report(data: dict[int, dict[str, RunStats]]) -> str:
+    lines = [
+        "# Histogram Exact GEM5 Performance Analysis",
+        "",
+        "This report is generated from the first simulation-stat section in each stats.txt file.",
+        "The second section is ignored because its CU counters are zero or `nan` after the kernel finishes.",
+        "",
+        "The assignment table uses `loadLatencyDist::mean` plus averages across active CUs for `vALUInsts`, `ldsBankAccesses`, `totalCycles`, and `vpc`.",
+        "Diagnostic total counters are reported separately and are not used as homework-table values.",
+        "",
+        "## Assignment Metrics",
+        "",
+    ]
+
+    validate_comparison_rows(assignment_metric_rows(), "Histogram assignment metrics")
+    for cu_count in CU_COUNTS:
+        naive = data[cu_count]["naive"]
+        optimized = data[cu_count]["optimized"]
+        lines.extend(
+            [
+                f"### {cu_count} Compute Units",
+                "",
+                "| gem5 stat | Naive | Optimized | Optimized vs Naive | Note |",
+                "|--------|-------|-----------|--------------------|------|",
+            ]
+        )
+        for label, attr, note, decimals in assignment_metric_rows():
+            naive_num = metric_number(naive, attr)
+            optimized_num = metric_number(optimized, attr)
+            change = (
+                pct_change(optimized_num, naive_num)
+                if naive_num is not None and optimized_num is not None
+                else "N/A"
+            )
+            lines.append(
+                f"| {label} | {metric_value(naive, attr, decimals)} | "
+                f"{metric_value(optimized, attr, decimals)} | {change} | {note} |"
+            )
+        lines.append("")
+
+    lines.extend(
+        [
+            "## Diagnostic Totals",
+            "",
+        ]
+    )
+    validate_comparison_rows(diagnostic_metric_rows(), "Histogram diagnostic metrics")
+    for cu_count in CU_COUNTS:
+        naive = data[cu_count]["naive"]
+        optimized = data[cu_count]["optimized"]
+        lines.extend(
+            [
+                f"### {cu_count} Compute Units",
+                "",
+                "| Metric | Naive | Optimized | Optimized vs Naive | Note |",
+                "|--------|-------|-----------|--------------------|------|",
+            ]
+        )
+        for label, attr, note, decimals in diagnostic_metric_rows():
+            naive_num = metric_number(naive, attr)
+            optimized_num = metric_number(optimized, attr)
+            change = (
+                pct_change(optimized_num, naive_num)
+                if naive_num is not None and optimized_num is not None
+                else "N/A"
+            )
+            lines.append(
+                f"| {label} | {metric_value(naive, attr, decimals)} | "
+                f"{metric_value(optimized, attr, decimals)} | {change} | {note} |"
+            )
+        lines.append("")
+
+    lines.extend(["## Scaling by Kernel", ""])
+    for kernel in KERNELS:
+        label = kernel.capitalize()
+        base = data[CU_COUNTS[0]][kernel].total_cycles_mean
+        lines.extend(
+            [
+                f"### {label}",
+                "",
+                "| CU | average totalCycles | Ratio vs 2 CU |",
+                "|----|---------------------|---------------|",
+            ]
+        )
+        for cu_count in CU_COUNTS:
+            run = data[cu_count][kernel]
+            lines.append(
+                f"| {cu_count} | {fmt(run.total_cycles_mean, 0)} | "
+                f"{ratio(base, run.total_cycles_mean)} |"
+            )
+        lines.append("")
+
+    lines.extend(["## Per-CU Details", ""])
+    for cu_count in CU_COUNTS:
+        for kernel in KERNELS:
+            run = data[cu_count][kernel]
+            lines.extend(
+                [
+                    f"### {kernel.capitalize()}, {cu_count} CUs",
+                    "",
+                    "| CU | vALUInsts | ldsBankAccesses | totalCycles | vpc |",
+                    "|----|-----------|-------------------|-------------|-----|",
+                ]
+            )
+            for cu in range(cu_count):
+                lines.append(
+                    f"| {cu} | {fmt(run.valu_insts_by_cu[cu], 0)} | "
+                    f"{fmt(run.lds_bank_accesses_by_cu[cu], 0)} | "
+                    f"{fmt(run.total_cycles_by_cu[cu], 0)} | "
+                    f"{fmt(run.vpc_by_cu[cu])} |"
+                )
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+def main() -> int:
+    histogram_dir = Path(__file__).resolve().parent
+    results_root = histogram_dir / "results"
+    report_path = histogram_dir / "exact_results.md"
+
+    try:
+        data = load_all(results_root)
+    except (KeyError, ValueError, FileNotFoundError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
     print_console_summary(data)
-    print("=" * 90)
-    generate_markdown_report(data)
+    report_path.write_text(markdown_report(data), encoding="utf-8")
+    print(f"\nReport saved to: {report_path}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
